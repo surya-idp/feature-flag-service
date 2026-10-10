@@ -121,4 +121,7 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
 # Binding to localhost inside a container is one of the most common first-time
 # Docker networking mistakes; it manifests as "connection refused" from outside.
 # ---------------------------------------------------------------------------
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --timeout-keep-alive 75 > the ALB idle timeout (60 s). uvicorn's default is 5 s: it would close
+# idle connections the load balancer still considers open, and the next request sent on one
+# of them fails with a 502. Same setting as the golden-path services.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "75"]
