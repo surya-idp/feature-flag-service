@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -102,7 +103,7 @@ def _merge_and_validate(existing: Flag, update: FlagUpdate) -> FlagCreate:
     merged state is invalid and must be rejected.
 
     Returns a FlagCreate so that Pydantic re-runs all validators on the merged
-    state, raising ValidationError (→ HTTP 422) if anything is inconsistent.
+    state; an inconsistent result is answered with HTTP 422.
     """
     provided = update.provided_fields()
 
@@ -115,9 +116,20 @@ def _merge_and_validate(existing: Flag, update: FlagUpdate) -> FlagCreate:
         "environment":        provided.get("environment",        existing.environment),
     }
 
-    # FlagCreate.model_validate raises ValidationError on cross-field failures.
-    # FastAPI translates unhandled ValidationError → HTTP 422 automatically.
-    return FlagCreate.model_validate(merged)
+    # FastAPI turns validation errors of the REQUEST BODY into HTTP 422 by itself, but a
+    # ValidationError raised by our own code inside a handler is an unhandled exception:
+    # the caller would get a 500. The merged state is invalid input, so say so (422), with
+    # the same message Pydantic would give.
+    try:
+        return FlagCreate.model_validate(merged)
+    except ValidationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=[
+                {"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]}
+                for e in error.errors()
+            ],
+        ) from error
 
 
 # ---------------------------------------------------------------------------
