@@ -82,6 +82,34 @@ class Settings:
             os.environ.get("CACHE_TTL_SECONDS", "10")
         )
 
+        # ------------------------------------------------------------------ #
+        # Kubernetes identity (app/kube_identity.py)                          #
+        # ------------------------------------------------------------------ #
+
+        # auto (default): accept ServiceAccount tokens when running in a pod.
+        # on / off: force it (tests, local runs).
+        self.kube_identity: str = os.environ.get("KUBE_IDENTITY", "auto").lower()
+
+        # The audience a caller's token must have been issued for. Callers mount a
+        # projected ServiceAccount token with exactly this audience.
+        self.kube_token_audience: str = os.environ.get(
+            "KUBE_TOKEN_AUDIENCE", "feature-flag-api"
+        )
+
+        # ServiceAccounts that get the admin role (may create and change flags), as
+        # comma-separated full names: system:serviceaccount:<namespace>:<name>.
+        # Every other ServiceAccount with a valid token is a viewer.
+        self.kube_admin_serviceaccounts: frozenset[str] = frozenset(
+            name.strip()
+            for name in os.environ.get("KUBE_ADMIN_SERVICEACCOUNTS", "").split(",")
+            if name.strip()
+        )
+
+        # The Kubernetes API, as every pod reaches it.
+        self.kube_api_url: str = os.environ.get(
+            "KUBE_API_URL", "https://kubernetes.default.svc"
+        )
+
     # ---------------------------------------------------------------------- #
     # Helpers                                                                  #
     # ---------------------------------------------------------------------- #
