@@ -106,6 +106,13 @@ jobs:
     runs-on: ubuntu-24.04-arm          # native arm64 = the EKS nodes' architecture
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # One build at a time, in push order. Image Updater deploys the image that was BUILT last,
+    # so two merges seconds apart must not build in parallel: the older commit could finish
+    # second and be deployed (both ran side by side on 2026-10-11). If a third push arrives
+    # while one waits, GitHub drops the waiting one; the newest still wins.
+    concurrency:
+      group: build-main
+      cancel-in-progress: false
 
     permissions:
       id-token: write  # REQUIRED for the OIDC token request to AWS
