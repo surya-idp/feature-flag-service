@@ -1,28 +1,21 @@
 # =============================================================================
-# .github/workflows/ci.yml — Feature Flag Service CI
+# .github/workflows/ci.yml - Feature Flag Service CI
 #
-# Three jobs:
-#   1. test           — runs on every push and every PR (all branches)
-#   2. build-and-push — runs only on push to main, only after test passes
-#                       pushes to ECR (not GHCR), SHA tag only (no :latest)
-#                       runs Trivy vulnerability scan (fails on HIGH/CRITICAL)
-#   3. update-env-config — updates overlays/dev/kustomization.yaml in env-config
-#                           repo with the new image SHA, using a short-lived
-#                           GitHub App installation token (no long-lived PAT)
+# Two jobs:
+#   1. test           - every push and every pull request
+#   2. build-and-push - push to main only, after test passes:
+#                       build, scan with Trivy (HIGH/CRITICAL fail the job), and only THEN
+#                       push to ECR with the commit SHA as the tag
 #
-# Auth strategy (zero static credentials):
-#   AWS access:    OIDC → IAM role idp-github-ci (no AWS_ACCESS_KEY_ID anywhere)
-#   env-config writes: GitHub App installation token generated per-run
-#                      via actions/create-github-app-token
-#                      (App: idp-ci-bot, owned by org surya-idp)
+# How a new image gets deployed: this workflow does not touch the deploy repo. Argo CD Image
+# Updater in the cluster sees the new tag in ECR and commits it to idp-gitops
+# (idp-gitops/platform/image-updater). So an image in ECR is an image that WILL be deployed,
+# which is why the scan runs before the push, not after it.
 #
-# Image tagging strategy:
-#   ECR registry:  693906847772.dkr.ecr.ap-south-1.amazonaws.com/feature-flag-service
-#   Tag:           git commit SHA only — no :latest tag ever
-#   Immutability:  enforced at ECR registry level (tag cannot be overwritten)
-#   Reason:        :latest is a mutable pointer that silently shifts after every
-#                  push. In a GitOps deployment manifest, :latest defeats the
-#                  entire point of having an immutable reference.
+# Credentials: none stored. AWS access is OIDC -> IAM role idp-github-ci. The idp-ci-bot key
+# that this repo used to hold (to commit the tag itself) is gone.
+#
+# Image tag: the git commit SHA, never :latest; ECR tags are immutable.
 # =============================================================================
 
 name: CI
@@ -104,33 +97,49 @@ jobs:
         run: pytest tests/ -v --tb=short
 
   # ---------------------------------------------------------------------------
-  # Job 2 — build-and-push
-  # Runs ONLY on push to main, only after test passes.
-  # Pushes to ECR using OIDC (no static AWS credentials).
+  # Job 2 - build-and-push (push to main only)
+  # Order matters: build -> scan -> push. Image Updater deploys whatever appears in ECR, so a
+  # vulnerable image must never get there.
   # ---------------------------------------------------------------------------
   build-and-push:
-    name: Build and Push to ECR
-    # Native arm64 runner (free for public repos): builds the arm64 image without QEMU.
-    runs-on: ubuntu-24.04-arm
+    name: Build, scan, push to ECR
+    runs-on: ubuntu-24.04-arm          # native arm64 = the EKS nodes' architecture
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     permissions:
-      id-token: write  # REQUIRED for OIDC token request
+      id-token: write  # REQUIRED for the OIDC token request to AWS
       contents: read
 
-    outputs:
-      # Pass the SHA to the update-env-config job so it can update the manifest
-      image_tag: ${{ steps.meta.outputs.image_tag }}
+    env:
+      IMAGE: 693906847772.dkr.ecr.ap-south-1.amazonaws.com/feature-flag-service:${{ github.sha }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Authenticate to AWS via OIDC — no static credentials.
-      # The IAM role trust policy is scoped to exactly:
-      #   repo:surya-idp@334455734/feature-flag-service@1368152185:ref:refs/heads/main
-      # Any other repo or branch cannot assume this role.
+      # Built into the runner's local Docker (same architecture as the nodes), not pushed yet.
+      - name: Build image
+        run: |
+          docker build \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -t "$IMAGE" .
+
+      # Fails the job on a HIGH or CRITICAL finding that has a fix. Nothing was pushed yet, so
+      # a failing image never reaches ECR and is never deployed.
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+      # Authenticate to AWS via OIDC - no static credentials. The role's trust policy allows
+      # exactly this repository on refs/heads/main.
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
@@ -138,145 +147,15 @@ jobs:
           aws-region: ap-south-1
 
       - name: Login to Amazon ECR
-        id: ecr-login
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
-      - name: Derive image metadata
-        id: meta
-        env:
-          ECR_REGISTRY: 693906847772.dkr.ecr.ap-south-1.amazonaws.com
-          ECR_REPOSITORY: feature-flag-service
+      # A re-run of the same commit must not fail on the immutable tag.
+      - name: Push image
         run: |
-          IMAGE_TAG="${{ github.sha }}"
-          FULL_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
-          echo "ecr_registry=${ECR_REGISTRY}" >> $GITHUB_OUTPUT
-          echo "ecr_repository=${ECR_REPOSITORY}" >> $GITHUB_OUTPUT
-
-      # "Re-run" of a green build: the SHA tag is immutable and already in ECR, so skip the
-      # build instead of failing on the push. Trivy below still gates the existing image.
-      - name: Check if image already exists
-        id: exists
-        run: |
-          if aws ecr describe-images --region ap-south-1 \
-               --repository-name "${{ steps.meta.outputs.ecr_repository }}" \
-               --image-ids imageTag="${{ steps.meta.outputs.image_tag }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Image ${{ steps.meta.outputs.image_tag }} already in ECR - skipping build"
+          if aws ecr describe-images --repository-name feature-flag-service \
+               --image-ids imageTag="${GITHUB_SHA}" >/dev/null 2>&1; then
+            echo "Image ${GITHUB_SHA} already in ECR - skipping push"
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            docker push "$IMAGE"
           fi
-
-      - name: Set up Docker Buildx
-        if: steps.exists.outputs.exists != 'true'
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - name: Build Docker image
-        if: steps.exists.outputs.exists != 'true'
-        run: |
-          docker buildx build \
-            --platform linux/arm64 \
-            --provenance=false \
-            --push \
-            --tag "${{ steps.meta.outputs.full_image }}" \
-            --label "org.opencontainers.image.revision=${{ github.sha }}" \
-            --label "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
-            .
-
-      # Push BEFORE Trivy scan: ECR scan-on-push fires asynchronously.
-      # We push first, then run Trivy as an explicit gate with exit-code: '1'.
-      # If Trivy finds HIGH/CRITICAL, the workflow fails — the image is in ECR
-      # but update-env-config (next job) depends on this job succeeding, so
-      # a vulnerable image never propagates to the deployment manifest.
-
-
-      # Trivy scans the just-pushed image. Fails the job on HIGH or CRITICAL findings.
-      # This means a vulnerable image is in ECR but NEVER gets deployed (next job
-      # depends on this one). The image can be manually deleted from ECR.
-      # The image was pushed by buildx and is not in the runner's local docker daemon,
-      # so Trivy pulls it from ECR. That needs registry credentials, and the image is
-      # arm64 while the runner is amd64, so the platform must be set explicitly.
-      - name: Authenticate Trivy to ECR
-        run: |
-          echo "TRIVY_USERNAME=AWS" >> "$GITHUB_ENV"
-          echo "TRIVY_PASSWORD=$(aws ecr get-login-password --region ap-south-1)" >> "$GITHUB_ENV"
-          echo "TRIVY_PLATFORM=linux/arm64" >> "$GITHUB_ENV"
-
-      - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ steps.meta.outputs.full_image }}
-          format: table
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: HIGH,CRITICAL
-
-      - name: Print image reference
-        run: |
-          echo "===== Image pushed to ECR ====="
-          echo "SHA tag (use for deployment): ${{ steps.meta.outputs.full_image }}"
-          echo ""
-          echo "ECR immutability is ENFORCED — this SHA tag cannot be overwritten."
-          echo "To use: reference this exact tag in the deployment manifest."
-
-  # ---------------------------------------------------------------------------
-  # Job 3 — update-env-config
-  # Runs after build-and-push succeeds.
-  # Updates overlays/dev/kustomization.yaml with the new image SHA.
-  # Uses a short-lived GitHub App installation token — no long-lived PAT.
-  # ---------------------------------------------------------------------------
-  update-env-config:
-    name: Update env-config (dev overlay)
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    permissions:
-      contents: read
-
-    steps:
-      - name: Generate GitHub App installation token
-        id: app-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
-        with:
-          # GitHub App idp-ci-bot (org surya-idp) with contents:write on
-          # idp-gitops repo only.
-          # App ID and private key are GitHub Actions secrets (not AWS secrets).
-          app-id: ${{ secrets.FF_IDP_CI_BOT_APP_ID }}
-          private-key: ${{ secrets.FF_IDP_CI_BOT_PRIVATE_KEY }}
-          # Scope token to only the env-config repo
-          repositories: idp-gitops
-
-      - name: Clone env-config repo
-        run: |
-          git clone https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/surya-idp/idp-gitops.git env-config
-
-      # Update newTag in the dev overlay; the Deployment and the migration Job both take
-      # their image from this one Kustomize images stanza.
-      - name: Update image SHA in env-config
-        env:
-          NEW_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-          CHANGED_FILE: apps/feature-flag-service/overlays/dev/kustomization.yaml
-          TOKEN: ${{ steps.app-token.outputs.token }}
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-        run: |
-          cd env-config
-          sed -i "s|newTag:.*|newTag: ${NEW_TAG}|g" "${CHANGED_FILE}"
-
-          # Commit as the App's bot user (name from the token, so an App rename needs no edit here)
-          BOT_ID=$(GH_TOKEN="${TOKEN}" gh api "/users/${APP_SLUG}[bot]" --jq .id)
-          git config user.name "${APP_SLUG}[bot]"
-          git config user.email "${BOT_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
-          git add "${CHANGED_FILE}"
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore(deploy): update feature-flag-service image to ${NEW_TAG}"
-          # Other CI bots (idp-portal, template services) push to the same repo; if one
-          # lands first, rebase onto it (different files, no conflicts) and retry.
-          for i in 1 2 3; do
-            git push origin main && break
-            [ "$i" = 3 ] && exit 1
-            sleep $((i * 5)); git pull --rebase origin main
-          done
-          echo "==> env-config updated: ${CHANGED_FILE} -> ${NEW_TAG}"
+          echo "Pushed $IMAGE. Image Updater commits this tag to idp-gitops when the cluster is up."
