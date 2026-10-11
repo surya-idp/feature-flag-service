@@ -158,7 +158,18 @@ jobs:
 
       # A re-run of the same commit must not fail on the immutable tag.
       - name: Push image
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # Only the branch's newest commit is pushed. Builds run one at a time (concurrency
+          # above) but GitHub does not run them in push order, and Image Updater deploys the
+          # image built last: an older commit pushed after a newer one would be deployed
+          # (seen on a template service, 2026-10-11). The newer commit's own run pushes.
+          head="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "::notice::main is already at ${head}; ${GITHUB_SHA} is built and scanned but not pushed."
+            exit 0
+          fi
           if aws ecr describe-images --repository-name feature-flag-service \
                --image-ids imageTag="${GITHUB_SHA}" >/dev/null 2>&1; then
             echo "Image ${GITHUB_SHA} already in ECR - skipping push"
