@@ -3,7 +3,8 @@ dependencies.py — Reusable FastAPI dependencies for authentication and RBAC.
 
 Two-layer dependency design
 ---------------------------
-  get_current_user  — any authenticated user (valid JWT required)
+  get_current_user  — any authenticated caller: a person with a JWT from /auth/login, or a
+                      service with its Kubernetes ServiceAccount token (kube_identity.py)
   require_admin     — admin role only (layered on top of get_current_user)
 
 The two-layer approach (rather than a single dependency with an allowed_roles
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 
+from app import kube_identity
 from app.auth import decode_access_token
 
 logger = logging.getLogger(__name__)
@@ -42,7 +44,11 @@ class CurrentUser:
 
 
 def get_current_user(token: str = Depends(_oauth2_scheme)) -> CurrentUser:
-    """Dependency: resolve a valid JWT to the caller's identity.
+    """Dependency: resolve the bearer token to the caller's identity.
+
+    Two kinds of token are accepted: a JWT signed by this service (people, after
+    /auth/login), and a Kubernetes ServiceAccount token issued for this service's audience
+    (other services in the cluster).
 
     Raises HTTP 401 (with WWW-Authenticate: Bearer) on any auth failure:
       - Missing Authorization header (OAuth2PasswordBearer raises this itself)
@@ -58,7 +64,12 @@ def get_current_user(token: str = Depends(_oauth2_scheme)) -> CurrentUser:
     try:
         claims = decode_access_token(token)
     except ValueError:
-        raise credentials_exception
+        # Not one of our own JWTs. A service inside the cluster proves who it is with its
+        # Kubernetes ServiceAccount token instead; Kubernetes is asked whether it is genuine.
+        identity = kube_identity.identify(token)
+        if identity is None:
+            raise credentials_exception
+        return CurrentUser(username=identity.username, role=identity.role)
 
     username: str = claims.get("sub", "")
     role: str = claims.get("role", "")
