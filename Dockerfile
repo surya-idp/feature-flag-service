@@ -32,7 +32,7 @@
 # Purpose: install Python dependencies (may require build tools).
 # Nothing from this stage except site-packages reaches the final image.
 # -----------------------------------------------------------------------------
-FROM python:3.12-slim AS builder
+FROM python:3.15-slim AS builder
 
 # Install build tools that some Python packages need to compile native
 # extensions.  gcc is the most common requirement; add others if needed.
@@ -58,7 +58,7 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 # Purpose: minimal image that actually runs the app.
 # Copies installed packages from builder; never sees gcc or other build tools.
 # -----------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.15-slim AS runtime
 
 # Create a dedicated non-root user.
 # Running as root inside a container is flagged by container security scanners
